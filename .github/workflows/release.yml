@@ -1,0 +1,39 @@
+# Builds the dll on every push to master and publishes it, with the license, as a release
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        run: msbuild dlssg-to-xefg.sln -p:Configuration=Release -p:Platform=x64 -m
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $zip = "dlssg-to-xefg-${{ github.run_number }}.zip"
+          Compress-Archive -Path bin\Release\dlssg_to_xefg_intel_is_better.dll, LICENSE -DestinationPath $zip
+          "ZIP=$zip" >> $env:GITHUB_ENV
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          gh release create "build-${{ github.run_number }}" $env:ZIP `
+            --target "${{ github.sha }}" `
+            --title "Build ${{ github.run_number }} ($sha)" `
+            --notes "Built from $sha."

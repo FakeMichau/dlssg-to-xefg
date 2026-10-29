@@ -19,7 +19,8 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
-    <PlatformToolset>v145</PlatformToolset>
+    <!-- The installed Visual Studio's own toolset (v145 for VS 2026), so CI runners with an older VS build it too -->
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
     <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
     <WholeProgramOptimization Condition="'$(Configuration)'=='Release'">true</WholeProgramOptimization>
