@@ -8,6 +8,8 @@ Replaces DLSS Frame Generation with Intel XeSS Frame Generation (XeFG), up to 6x
 what makes it work as an `nvngx_dlssg` replacement, and it lifts XeFG's 4x cap and its non-Intel 2x clamp without
 patching any code.
 
+Intel GPUs with XMX get XeFG's XMX network, decided by XeFG's own check. Every other GPU gets the default one.
+
 DX12 only, XeFG has no Vulkan API.
 
 ## Usage

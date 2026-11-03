@@ -22,6 +22,9 @@ constexpr auto XeFGInputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 // XeFG's default network. libxess_fg.dll doesn't ship its multi frame variant (16), which Init would switch to
 constexpr int32_t XeFGModel = 18;
 
+// XeFG's XMX network, which it only picks itself on Intel GPUs with XMX
+constexpr int32_t XeFGXmxModel = 17;
+
 FrameGenerator::Context::~Context()
 {
 	if (handle)
@@ -284,11 +287,20 @@ static void GetProjectionMatrix(const NGXParameter& params, bool depthInverted, 
 
 bool FrameGenerator::CreateContext()
 {
+	// XeFG's own XMX check decides, anything but its XMX pick gets the default network.
+	// ponytail: probed once for the first device, per adapter if a game ever renders on two GPUs
+	static const int32_t model = [this]
+		{
+			const int32_t picked = XeFG::AutoModel(device.Get()) == XeFGXmxModel ? XeFGXmxModel : XeFGModel;
+			Log::Info("XeFG model: {}", picked);
+			return picked;
+		}();
+
 	auto newContext = std::make_shared<Context>();
 
 	// Process wide, they also affect other XeFG contexts. Must happen before the context picks its model
 	XeFG::SetMaxInterpolatedFrames(MaxFrames);
-	XeFG::OverrideModel(XeFGModel);
+	XeFG::OverrideModel(model);
 
 	if (auto result = XeFG::CreateContext(device.Get(), &newContext->handle); result != XEFGD_RESULT_SUCCESS)
 	{
