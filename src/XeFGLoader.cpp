@@ -44,6 +44,37 @@ namespace
 		return false;
 	}
 
+	// Unloads it again when it's incompatible
+	bool TryPath(const std::filesystem::path& path)
+	{
+		HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+
+		if (!module)
+		{
+			Log::Warn("Can't load {}", path.string());
+			return false;
+		}
+
+		if (TryModule(module))
+			return true;
+
+		FreeLibrary(module);
+		return false;
+	}
+
+	// The libxess_fg.dll in <folder with dlls> when this dll is in <folder with dlls>\custom\<any name>\dlssg, empty
+	// otherwise
+	std::filesystem::path CustomFolderXeFGPath()
+	{
+		auto dlssg = ThisModulePath().parent_path();
+		auto custom = dlssg.parent_path().parent_path();
+
+		if (_wcsicmp(dlssg.filename().c_str(), L"dlssg") != 0 || _wcsicmp(custom.filename().c_str(), L"custom") != 0)
+			return {};
+
+		return custom.parent_path() / XeFGDllName;
+	}
+
 	bool Search()
 	{
 		for (HMODULE module : LoadedXeFGModules())
@@ -58,19 +89,13 @@ namespace
 			return true;
 		}
 
-		auto path = ThisModulePath().replace_filename(XeFGDllName);
-		HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-
-		if (!module)
-		{
-			Log::Error("No compatible libxess_fg.dll is loaded and {} can't be loaded", path.string());
-			return false;
-		}
-
-		if (TryModule(module))
+		if (TryPath(ThisModulePath().replace_filename(XeFGDllName)))
 			return true;
 
-		FreeLibrary(module);
+		if (auto path = CustomFolderXeFGPath(); !path.empty() && TryPath(path))
+			return true;
+
+		Log::Error("No compatible libxess_fg.dll found");
 		return false;
 	}
 } // namespace

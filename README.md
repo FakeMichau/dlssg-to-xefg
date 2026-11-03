@@ -22,6 +22,7 @@ itself.
 
 1. Every `libxess_fg.dll` already loaded in the process, the first compatible one wins
 2. The `libxess_fg.dll` next to this dll
+3. When this dll is in `<folder with dlls>\custom\<any name>\dlssg`, the `libxess_fg.dll` in `<folder with dlls>`
 
 Compatible means a build with known function addresses (XeFG 1.3.1 from XeSS SDK 3.0.2, XeFG 1.3.4), or any XeFG
 1.3.x where the functions can be found by scanning and the settings match one of the known layouts. The struct layouts

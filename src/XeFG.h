@@ -136,7 +136,8 @@ static_assert(sizeof(xefgd_exec_params_t) == 608);
 
 namespace XeFG
 {
-	// Picks a compatible libxess_fg.dll, loaded ones first, then the one next to this dll. Only searches once
+	// Picks a compatible libxess_fg.dll, loaded ones first, then the one next to this dll, then the one in
+	// <folder with dlls> when this dll is in <folder with dlls>\custom\<any name>\dlssg. Only searches once
 	bool Load();
 
 	// Locates the hidden API in module, false when it isn't a build we can drive. Replaces the previous module's API
