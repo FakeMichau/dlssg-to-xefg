@@ -1,5 +1,6 @@
 #include "FrameGenerator.h"
 #include "Log.h"
+#include "Plugin.h"
 #include "Util.h"
 
 #include <DirectXMath.h>
@@ -285,22 +286,27 @@ static void GetProjectionMatrix(const NGXParameter& params, bool depthInverted, 
 	memcpy(out, projection, sizeof(projection));
 }
 
-bool FrameGenerator::CreateContext()
+// XeFG's own XMX check decides whether the XMX network can be used, every other GPU gets the default network.
+static int32_t PickModel(ID3D12Device* device)
 {
-	// XeFG's own XMX check decides, anything but its XMX pick gets the default network.
-	// ponytail: probed once for the first device, per adapter if a game ever renders on two GPUs
-	static const int32_t model = [this]
+	static const bool xmx = [device]
 		{
-			const int32_t picked = XeFG::AutoModel(device.Get()) == XeFGXmxModel ? XeFGXmxModel : XeFGModel;
-			Log::Info("XeFG model: {}", picked);
-			return picked;
+			const bool supported = XeFG::AutoModel(device) == XeFGXmxModel;
+			Log::Info("XMX network supported: {}", supported);
+			Plugin::xmx = supported ? Plugin::Xmx::Supported : Plugin::Xmx::Unsupported;
+			return supported;
 		}();
 
+	return xmx && Plugin::options.xmxNetwork ? XeFGXmxModel : XeFGModel;
+}
+
+bool FrameGenerator::CreateContext()
+{
 	auto newContext = std::make_shared<Context>();
 
 	// Process wide, they also affect other XeFG contexts. Must happen before the context picks its model
 	XeFG::SetMaxInterpolatedFrames(MaxFrames);
-	XeFG::OverrideModel(model);
+	XeFG::OverrideModel(settings.model);
 
 	if (auto result = XeFG::CreateContext(device.Get(), &newContext->handle); result != XEFGD_RESULT_SUCCESS)
 	{
@@ -317,8 +323,8 @@ bool FrameGenerator::CreateContext()
 	initParams.maxInterpolatedFrames = MaxFrames;
 	initParams.uiMode = settings.uiMode;
 
-	Log::Info("Creating XeFG context: {}x{}, format: {}, flags: {:X}, ui mode: {}", settings.width, settings.height,
-		(uint32_t)settings.format, settings.initFlags, settings.uiMode);
+	Log::Info("Creating XeFG context: {}x{}, format: {}, flags: {:X}, ui mode: {}, model: {}", settings.width,
+		settings.height, (uint32_t)settings.format, settings.initFlags, settings.uiMode, settings.model);
 
 	if (auto result = XeFG::Init(newContext->handle, initParams); result != XEFGD_RESULT_SUCCESS)
 	{
@@ -337,7 +343,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		Log::Warn("DLSSG.CameraMotionIncluded is 0, the camera's motion is missing from the motion vectors");
 
 	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
-	auto hudless = params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr);
+	auto hudless = Plugin::options.hudlessUi ? params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr) : nullptr;
 	auto depth = params.GetOr<ID3D12Resource*>("DLSSG.Depth", nullptr);
 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
@@ -352,6 +358,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	wanted.initFlags = (depthInverted ? XEFGD_INIT_FLAG_INVERTED_DEPTH : 0) |
 		(params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
 	wanted.uiMode = hudless ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
+	wanted.model = PickModel(device.Get());
 
 	if (wanted != settings)
 	{
@@ -367,6 +374,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	if (!context)
 		return;
+
+	XeFG::SetDebugLines(Plugin::options.debugLines);
 
 	context->current ^= 1;
 	auto& frame = context->frames[context->current];
@@ -511,7 +520,12 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	const uint32_t frameIndex = std::clamp(params.GetOr<uint32_t>("DLSSG.MultiFrameIndex", 1), 1u, frameCount);
 
 	if (frameIndex == 1)
+	{
 		CaptureRealFrame(cmdList, params);
+
+		Plugin::Report({ settings.width, settings.height, frameCount,
+			settings.uiMode != XEFGD_UI_MODE_AUTO, settings.model == XeFGXmxModel, context == nullptr });
+	}
 
 	const auto result = Interpolate(cmdList, output->GetDesc(), frameIndex, frameCount);
 
