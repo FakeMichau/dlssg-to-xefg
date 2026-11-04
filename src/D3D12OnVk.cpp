@@ -2060,12 +2060,22 @@ namespace
 			for (UINT i = 0; i < count; i++)
 			{
 				VkMemoryRequirements2 reqs{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+				auto& vk = self->vk;
+				VkResult result = VK_SUCCESS;
 
+				// Devices created below Vulkan 1.3 can't query without an object, so one is created and destroyed
 				if (descs[i].Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
 				{
 					auto create = BufferCreateInfo(descs[i]);
 					VkDeviceBufferMemoryRequirements query{ VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS, nullptr, &create };
-					self->vk.vkGetDeviceBufferMemoryRequirements(self->handle, &query, &reqs);
+					VkBuffer buffer;
+					if (vk.vkGetDeviceBufferMemoryRequirements)
+						vk.vkGetDeviceBufferMemoryRequirements(self->handle, &query, &reqs);
+					else if ((result = vk.vkCreateBuffer(self->handle, &create, nullptr, &buffer)) == VK_SUCCESS)
+					{
+						vk.vkGetBufferMemoryRequirements(self->handle, buffer, &reqs.memoryRequirements);
+						vk.vkDestroyBuffer(self->handle, buffer, nullptr);
+					}
 				}
 				else
 				{
@@ -2078,7 +2088,20 @@ namespace
 
 					auto create = ImageCreateInfo(descs[i], format);
 					VkDeviceImageMemoryRequirements query{ VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, nullptr, &create };
-					self->vk.vkGetDeviceImageMemoryRequirements(self->handle, &query, &reqs);
+					VkImage image;
+					if (vk.vkGetDeviceImageMemoryRequirements)
+						vk.vkGetDeviceImageMemoryRequirements(self->handle, &query, &reqs);
+					else if ((result = vk.vkCreateImage(self->handle, &create, nullptr, &image)) == VK_SUCCESS)
+					{
+						vk.vkGetImageMemoryRequirements(self->handle, image, &reqs.memoryRequirements);
+						vk.vkDestroyImage(self->handle, image, nullptr);
+					}
+				}
+
+				if (result != VK_SUCCESS)
+				{
+					*info = { UINT64_MAX, 0 };
+					return info;
 				}
 
 				UINT64 alignment = std::max<UINT64>(reqs.memoryRequirements.alignment, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
@@ -2221,9 +2244,9 @@ ID3D12Device* D3D12OnVk::CreateDevice(const DeviceInfo& info)
 	device->physicalDevice = info.physicalDevice;
 	device->handle = info.device;
 
-	if (!vk.vkCreateComputePipelines || !vk.vkGetDeviceImageMemoryRequirements)
+	if (!vk.vkCreateComputePipelines)
 	{
-		Log::Error("D3D12OnVk: the device lacks Vulkan 1.3 functions");
+		Log::Error("D3D12OnVk: can't load the device's Vulkan functions");
 		Object::Release(device);
 		return nullptr;
 	}
@@ -2237,11 +2260,13 @@ ID3D12Device* D3D12OnVk::CreateDevice(const DeviceInfo& info)
 	if (id.deviceLUIDValid)
 		memcpy(&device->luid, id.deviceLUID, sizeof(LUID));
 
-	// ponytail: assumes the game enabled the feature when the GPU has it
+	// vkGetDeviceProcAddr returns no 1.3 core functions for a device created below 1.3, which then can't use the
+	// feature unless it enabled VK_KHR_shader_integer_dot_product
+	// ponytail: assumes a 1.3 device enabled the feature when the GPU has it, and ignores the extension on older ones
 	VkPhysicalDeviceVulkan13Features features13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
 	VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features13 };
 	vk.vkGetPhysicalDeviceFeatures2(info.physicalDevice, &features);
-	device->integerDotProduct = features13.shaderIntegerDotProduct;
+	device->integerDotProduct = features13.shaderIntegerDotProduct && vk.vkGetDeviceImageMemoryRequirements;
 
 	VkPipelineCacheCreateInfo cacheInfo{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
 	vk.vkCreatePipelineCache(info.device, &cacheInfo, nullptr, &device->pipelineCache);
