@@ -2,6 +2,8 @@
 // because NVIDIA's headers aren't GPL compatible.
 #pragma once
 
+#include "Vk.h"
+
 #include <cstdint>
 
 struct ID3D11Resource;
@@ -22,6 +24,34 @@ struct NGXHandle
 {
 	uint32_t Id;
 };
+
+// NVSDK_NGX_Resource_VK, Vulkan resource parameters are void* pointing at one
+struct NGXResourceVK
+{
+	union
+	{
+		struct
+		{
+			VkImageView ImageView;
+			VkImage Image;
+			VkImageSubresourceRange SubresourceRange;
+			VkFormat Format;
+			unsigned int Width;
+			unsigned int Height;
+		} ImageViewInfo;
+
+		struct
+		{
+			VkBuffer Buffer;
+			unsigned int SizeInBytes;
+		} BufferInfo;
+	} Resource;
+
+	uint32_t Type; // 0 = image view, 1 = buffer
+	bool ReadWrite;
+};
+
+constexpr uint32_t NGX_RESOURCE_VK_TYPE_IMAGE_VIEW = 0;
 
 struct NGXFeatureRequirement
 {

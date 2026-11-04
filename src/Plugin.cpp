@@ -93,7 +93,7 @@ namespace
 			api->SetBool(self, "XmxNetwork", xmxNetwork);
 		}
 
-		api->ItemTooltip(noXmx ? "Only for Intel GPUs with XMX"
+		api->ItemTooltip(noXmx ? "Only for Intel GPUs with XMX, on DX12"
 							   : "XeFG's network for Intel GPUs with XMX.\nOff uses the one every other GPU gets.");
 		api->Disabled(false);
 

@@ -1,4 +1,5 @@
 #include "FrameGenerator.h"
+#include "D3D12OnVk.h"
 #include "Log.h"
 #include "Plugin.h"
 #include "Util.h"
@@ -289,6 +290,13 @@ static void GetProjectionMatrix(const NGXParameter& params, bool depthInverted, 
 // XeFG's own XMX check decides whether the XMX network can be used, every other GPU gets the default network.
 static int32_t PickModel(ID3D12Device* device)
 {
+	// The XMX network needs Intel's D3D12 driver extension, which Vulkan doesn't have
+	if (D3D12OnVk::IsDevice(device))
+	{
+		Plugin::xmx = Plugin::Xmx::Unsupported;
+		return XeFGModel;
+	}
+
 	static const bool xmx = [device]
 		{
 			const bool supported = XeFG::AutoModel(device) == XeFGXmxModel;

@@ -30,6 +30,7 @@
     <TargetName>dlssg_to_xefg_intel_is_better</TargetName>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(Configuration)\</IntDir>
+    <DxilSpirvBuild>$(SolutionDir)obj\dxil-spirv</DxilSpirvBuild>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -38,6 +39,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>third_party\Vulkan-Headers\include;third_party\dxil-spirv;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- Static CRT: we can be loaded from any folder, a dll we'd depend on might not be found there -->
       <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
       <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreaded</RuntimeLibrary>
@@ -47,12 +49,14 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d12.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxil-spirv-c-static.lib;dxil-converter.lib;spirv-module.lib;glslang-spirv-builder.lib;llvm-bc.lib;bc-decoder.lib;dxbc-spirv.lib;dxil-utils.lib;dxil-debug.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(DxilSpirvBuild)\lib\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <EnableCOMDATFolding Condition="'$(Configuration)'=='Release'">true</EnableCOMDATFolding>
       <OptimizeReferences Condition="'$(Configuration)'=='Release'">true</OptimizeReferences>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\D3D12OnVk.cpp" />
     <ClCompile Include="src\Exports.cpp" />
     <ClCompile Include="src\FrameGenerator.cpp" />
     <ClCompile Include="src\Log.cpp" />
@@ -61,13 +65,22 @@
     <ClCompile Include="src\XeFGLoader.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\D3D12OnVk.h" />
+    <ClInclude Include="src\D3D12Vtables.h" />
     <ClInclude Include="src\FrameGenerator.h" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\NGX.h" />
     <ClInclude Include="src\optiscaler_plugin.h" />
     <ClInclude Include="src\Plugin.h" />
     <ClInclude Include="src\Util.h" />
+    <ClInclude Include="src\Vk.h" />
     <ClInclude Include="src\XeFG.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <!-- dxil-spirv's static C API, built by its own CMake project with our static CRT. Needs cmake on PATH. Its warnings
+       aren't ours to fix, the output only shows with detailed verbosity -->
+  <Target Name="BuildDxilSpirv" BeforeTargets="Link">
+    <Exec Condition="!Exists('$(DxilSpirvBuild)\CMakeCache.txt')" Command="cmake -S &quot;$(ProjectDir)third_party\dxil-spirv&quot; -B &quot;$(DxilSpirvBuild)&quot; -DDXIL_SPIRV_CLI=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW &quot;-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$&lt;$&lt;CONFIG:Debug&gt;:Debug&gt;&quot; &quot;-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=$(DxilSpirvBuild)\lib&quot; -DCMAKE_POLICY_VERSION_MINIMUM=3.5" StandardOutputImportance="low" />
+    <Exec Command="cmake --build &quot;$(DxilSpirvBuild)&quot; --config $(Configuration) --target dxil-spirv-c-static --parallel" StandardOutputImportance="low" IgnoreStandardErrorWarningFormat="true" />
+  </Target>
 </Project>

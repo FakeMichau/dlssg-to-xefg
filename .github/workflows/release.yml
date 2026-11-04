@@ -14,6 +14,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # The only ones of dxil-spirv's submodules its C API needs
+      - name: dxil-spirv dependencies
+        run: git -C third_party/dxil-spirv submodule update --init third_party/spirv-headers subprojects/dxbc-spirv
 
       - uses: microsoft/setup-msbuild@v2
 
