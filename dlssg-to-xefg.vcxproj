@@ -78,8 +78,9 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <!-- dxil-spirv's static C API, built by its own CMake project with our static CRT. Needs cmake on PATH. Its warnings
-       aren't ours to fix, the output only shows with detailed verbosity -->
-  <Target Name="BuildDxilSpirv" BeforeTargets="Link">
+       aren't ours to fix, the output only shows with detailed verbosity. SkipDxilSpirv=true links the libs already in
+       $(DxilSpirvBuild)\lib as they are, for CI restoring them from its cache -->
+  <Target Name="BuildDxilSpirv" BeforeTargets="Link" Condition="'$(SkipDxilSpirv)'!='true'">
     <Exec Condition="!Exists('$(DxilSpirvBuild)\CMakeCache.txt')" Command="cmake -S &quot;$(ProjectDir)third_party\dxil-spirv&quot; -B &quot;$(DxilSpirvBuild)&quot; -DDXIL_SPIRV_CLI=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW &quot;-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$&lt;$&lt;CONFIG:Debug&gt;:Debug&gt;&quot; &quot;-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=$(DxilSpirvBuild)\lib&quot; -DCMAKE_POLICY_VERSION_MINIMUM=3.5" StandardOutputImportance="low" />
     <Exec Command="cmake --build &quot;$(DxilSpirvBuild)&quot; --config $(Configuration) --target dxil-spirv-c-static --parallel" StandardOutputImportance="low" IgnoreStandardErrorWarningFormat="true" />
   </Target>
