@@ -316,6 +316,9 @@ namespace
 		bool integerDotProduct = false;
 		VkPipelineCache pipelineCache = VK_NULL_HANDLE;
 
+		// Raw and structured SRVs can be storage buffers when any 4-byte aligned range can be bound as one
+		bool storageBuffers = false;
+
 		// The game's command buffer of the evaluation in progress. XeFG's own command lists record into it instead of
 		// being submitted, a game's queues are only safe to use from the game
 		VkCommandBuffer current = VK_NULL_HANDLE;
@@ -420,17 +423,17 @@ namespace
 			if (poolNext == group.size())
 			{
 				const VkDescriptorPoolSize sizes[] = {
-					{ VK_DESCRIPTOR_TYPE_SAMPLER, 1024 },
-					{ VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192 },
-					{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096 },
-					{ VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048 },
-					{ VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 2048 },
-					{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2048 },
-					{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 },
+					{ VK_DESCRIPTOR_TYPE_SAMPLER, 256 },
+					{ VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2048 },
+					{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024 },
+					{ VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 512 },
+					{ VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 512 },
+					{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 512 },
+					{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024 },
 				};
 
 				VkDescriptorPoolCreateInfo info{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-				info.maxSets = 1024;
+				info.maxSets = 256;
 				info.poolSizeCount = (uint32_t)std::size(sizes);
 				info.pPoolSizes = sizes;
 
@@ -854,6 +857,9 @@ namespace
 		uint64_t elementSize = stride ? stride : raw ? 4 : format->bytes;
 		d.kind = Descriptor::TexelBuffer;
 		d.bufferView = r->BufferView(format->vk, first * elementSize, count * elementSize);
+
+		// Raw and structured SRVs bound as storage buffers address the same range
+		d.buffer = { r->buffer, first * elementSize, count * elementSize };
 	}
 
 	// Root signatures
@@ -1007,6 +1013,7 @@ namespace
 	struct Translation
 	{
 		const RootSignature* rootSignature;
+		bool storageBuffers; // raw and structured SRVs as storage buffers, else texel buffers
 		std::vector<Binding> bindings;
 
 		uint32_t Add(VkDescriptorType type, uint32_t count, uint32_t parameter, uint32_t offset,
@@ -1067,13 +1074,17 @@ namespace
 		if (!t.Locate(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, *d3d, parameter, offset))
 			return false;
 
-		VkDescriptorType type = IsBuffer(d3d->kind) || d3d->kind == DXIL_SPV_RESOURCE_KIND_TYPED_BUFFER
-			? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+		// Loads from a storage buffer at an address the same for the whole wave can be scalar loads, from a texel
+		// buffer every lane loads a word
+		const bool ssbo = IsBuffer(d3d->kind) && t.storageBuffers;
+		VkDescriptorType type = ssbo ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+			: IsBuffer(d3d->kind) || d3d->kind == DXIL_SPV_RESOURCE_KIND_TYPED_BUFFER ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+			: VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
 
 		*vulkan = {};
 		vulkan->buffer_binding.binding = t.Add(type, d3d->range_size, parameter, offset, VK_NULL_HANDLE, ViewType(d3d->kind));
-		vulkan->buffer_binding.descriptor_type = IsBuffer(d3d->kind) ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER
-			: DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
+		vulkan->buffer_binding.descriptor_type = ssbo ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_SSBO
+			: IsBuffer(d3d->kind) ? DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER : DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
 		return true;
 	}
 
@@ -1152,6 +1163,92 @@ namespace
 			Log::Warn("dxil-spirv: {}", message);
 	}
 
+	// dxil-spirv turns dot4add_i8packed into OpSDot and an OpIAdd of the accumulator, since D3D12's doesn't saturate.
+	// AMD's compiler then reassociates the long chains of adds in XeFG's int8 convolutions, keeping every dot product
+	// live until a final sum: twice the registers of D3D12, spills. Each such pair becomes OpSDotAccSat, which it keeps
+	// as one accumulating v_dot4 per step. The results only differ where accumulator + dot product leaves the 32-bit
+	// range: saturated instead of wrapped, which a network's sums of 8-bit products don't come near
+	void FuseDotAccumulate(std::vector<uint32_t>& spirv)
+	{
+		constexpr uint32_t OpName = 5, OpMemberName = 6, OpTypeInt = 21, OpDecorate = 71, OpMemberDecorate = 72,
+			OpIAdd = 128, OpSDot = 4450, OpUDot = 4451, OpSDotAccSat = 4453, OpUDotAccSat = 4454;
+		constexpr size_t Header = 5;
+
+		// Uses of every id, counted conservatively: any word after an instruction's opcode that equals it. And the
+		// integer type of every id that has one: its instruction's first operand is an integer type
+		const uint32_t bound = spirv.size() > Header ? spirv[3] : 0;
+		std::vector<uint32_t> uses(bound), types(bound);
+		std::vector<bool> intTypes(bound);
+		std::vector<size_t> dots(bound, 0); // where each OpSDot/OpUDot result is defined
+		for (size_t i = Header; i < spirv.size() && spirv[i] >> 16; i += spirv[i] >> 16)
+		{
+			const uint32_t op = spirv[i] & 0xFFFF, words = spirv[i] >> 16;
+			if (i + words > spirv.size())
+				return;
+
+			for (uint32_t w = 1; w < words; w++)
+			{
+				if (spirv[i + w] < bound)
+					uses[spirv[i + w]]++;
+			}
+
+			if (op == OpTypeInt && spirv[i + 1] < bound)
+				intTypes[spirv[i + 1]] = true;
+			else if (words >= 3 && spirv[i + 1] < bound && intTypes[spirv[i + 1]] && spirv[i + 2] < bound &&
+				op != OpName && op != OpMemberName && op != OpDecorate && op != OpMemberDecorate)
+				types[spirv[i + 2]] = spirv[i + 1];
+
+			// result type, result, vector 1, vector 2, packed vector format
+			if ((op == OpSDot || op == OpUDot) && words == 6 && spirv[i + 2] < bound)
+			{
+				dots[spirv[i + 2]] = i;
+				uses[spirv[i + 2]]--;
+			}
+		}
+
+		// An add of a dot product that only it uses, all of one type, becomes an accumulating dot product
+		std::vector<std::pair<size_t, uint32_t>> fusion(spirv.size()); // per add: the dot's index and the accumulator
+		std::vector<bool> fused(spirv.size());
+		for (size_t i = Header; i < spirv.size() && spirv[i] >> 16; i += spirv[i] >> 16)
+		{
+			// result type, result, operand 1, operand 2
+			if (spirv[i] != (5u << 16 | OpIAdd))
+				continue;
+
+			for (int k = 0; k < 2; k++)
+			{
+				const uint32_t dot = spirv[i + 3 + k], acc = spirv[i + 4 - k];
+				const size_t d = dot < bound ? dots[dot] : 0;
+				if (d && uses[dot] == 1 && spirv[d + 1] == spirv[i + 1] && acc < bound && types[acc] == spirv[i + 1])
+				{
+					fusion[i] = { d, acc };
+					fused[d] = true;
+					break;
+				}
+			}
+		}
+
+		std::vector<uint32_t> out(spirv.begin(), spirv.begin() + std::min(Header, spirv.size()));
+		out.reserve(spirv.size());
+		for (size_t i = Header; i < spirv.size(); i += std::max(spirv[i] >> 16, 1u))
+		{
+			if (fused[i])
+				continue;
+
+			if (auto [d, acc] = fusion[i]; d)
+			{
+				const uint32_t accSat = (spirv[d] & 0xFFFF) == OpSDot ? OpSDotAccSat : OpUDotAccSat;
+				out.insert(out.end(), { 7u << 16 | accSat, spirv[i + 1], spirv[i + 2], spirv[d + 3], spirv[d + 4], acc,
+					spirv[d + 5] });
+				continue;
+			}
+
+			out.insert(out.end(), spirv.begin() + i, spirv.begin() + std::min(spirv.size(), i + std::max(spirv[i] >> 16, 1u)));
+		}
+
+		spirv = std::move(out);
+	}
+
 	bool Translate(Device* device, const D3D12_SHADER_BYTECODE& bytecode, Translation& translation,
 		std::vector<uint32_t>& spirv)
 	{
@@ -1176,6 +1273,11 @@ namespace
 		dxil_spv_option_shader_i8_dot i8Dot{ { DXIL_SPV_OPTION_SHADER_I8_DOT }, device->integerDotProduct };
 		dxil_spv_converter_add_option(converter, &i8Dot.base);
 
+		// Storage buffers bind at their first element, any multiple of 4 bytes
+		dxil_spv_option_ssbo_alignment ssboAlignment{ { DXIL_SPV_OPTION_SSBO_ALIGNMENT },
+			std::max<unsigned>((unsigned)device->properties.limits.minStorageBufferOffsetAlignment, 1) };
+		dxil_spv_converter_add_option(converter, &ssboAlignment.base);
+
 		bool ok = dxil_spv_converter_run(converter) == DXIL_SPV_SUCCESS;
 		if (ok)
 		{
@@ -1184,6 +1286,7 @@ namespace
 
 			spirv.assign(static_cast<const uint32_t*>(compiled.data),
 				static_cast<const uint32_t*>(compiled.data) + compiled.size / 4);
+			FuseDotAccumulate(spirv);
 		}
 		else
 		{
@@ -1853,7 +1956,7 @@ namespace
 			const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** out)
 		{
 			auto& vk = self->vk;
-			Translation translation{ As<RootSignature>(desc->pRootSignature) };
+			Translation translation{ As<RootSignature>(desc->pRootSignature), self->storageBuffers };
 			std::vector<uint32_t> spirv;
 
 			if (!Translate(self, desc->CS, translation, spirv))
@@ -2257,6 +2360,7 @@ ID3D12Device* D3D12OnVk::CreateDevice(const DeviceInfo& info)
 	VkPhysicalDeviceProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id };
 	vk.vkGetPhysicalDeviceProperties2(info.physicalDevice, &properties);
 	device->properties = properties.properties;
+	device->storageBuffers = device->properties.limits.minStorageBufferOffsetAlignment <= 4;
 	if (id.deviceLUIDValid)
 		memcpy(&device->luid, id.deviceLUID, sizeof(LUID));
 
