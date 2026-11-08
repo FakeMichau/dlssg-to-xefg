@@ -318,7 +318,8 @@ namespace
 
 		// Raw and structured SRVs can be storage buffers when any 4-byte aligned range can be bound as one
 		bool storageBuffers = false;
-		bool vulkanMemoryModel = false; // assumed enabled, the DXIL shaders are translated to it
+		bool vulkanMemoryModel = false; // assumed enabled, DXIL shaders using Device scope are translated to it
+		bool fuseDots = false;          // see FuseDotAccumulate
 
 		// The game's command buffer of the evaluation in progress. XeFG's own command lists record into it instead of
 		// being submitted, a game's queues are only safe to use from the game
@@ -1200,7 +1201,8 @@ namespace
 	// AMD's compiler then reassociates the long chains of adds in XeFG's int8 convolutions, keeping every dot product
 	// live until a final sum: twice the registers of D3D12, spills. Each such pair becomes OpSDotAccSat, which it keeps
 	// as one accumulating v_dot4 per step. The results only differ where accumulator + dot product leaves the 32-bit
-	// range: saturated instead of wrapped, which a network's sums of 8-bit products don't come near
+	// range: saturated instead of wrapped, which a network's sums of 8-bit products don't come near. AMD only: other
+	// GPUs may have no saturating dot product instruction, and weren't measured
 	void FuseDotAccumulate(std::vector<uint32_t>& spirv)
 	{
 		constexpr uint32_t OpName = 5, OpMemberName = 6, OpTypeInt = 21, OpDecorate = 71, OpMemberDecorate = 72,
@@ -1322,6 +1324,29 @@ namespace
 		}
 	}
 
+	// Whether SPIR-V uses Device scope in a barrier or an atomic
+	bool UsesDeviceScope(std::span<const uint32_t> spirv)
+	{
+		constexpr uint32_t OpConstant = 43, OpAtomicStore = 228, OpControlBarrier = 224, OpMemoryBarrier = 225,
+			OpAtomicFirst = 227, OpAtomicLast = 242, OpAtomicFlagClear = 319, ScopeDevice = 1;
+
+		std::vector<uint32_t> deviceScope; // constants equal to ScopeDevice
+		for (size_t i = 5; i < spirv.size() && spirv[i] >> 16 && i + (spirv[i] >> 16) <= spirv.size(); i += spirv[i] >> 16)
+		{
+			const uint32_t op = spirv[i] & 0xFFFF, words = spirv[i] >> 16;
+			auto device = [&](size_t word)
+				{ return word < words && std::ranges::find(deviceScope, spirv[i + word]) != deviceScope.end(); };
+			if (op == OpConstant && words == 4 && spirv[i + 3] == ScopeDevice)
+				deviceScope.push_back(spirv[i + 2]);
+			else if ((op == OpControlBarrier && (device(1) || device(2))) || (op == OpMemoryBarrier && device(1)) ||
+				((op == OpAtomicStore || op == OpAtomicFlagClear) && device(2)) ||
+				(op >= OpAtomicFirst && op <= OpAtomicLast && op != OpAtomicStore && device(4)))
+				return true;
+		}
+
+		return false;
+	}
+
 	bool Translate(Device* device, const D3D12_SHADER_BYTECODE& bytecode, Translation& translation,
 		std::vector<uint32_t>& spirv)
 	{
@@ -1334,43 +1359,60 @@ namespace
 			return false;
 		}
 
-		dxil_spv_converter converter = nullptr;
-		dxil_spv_create_converter(blob, &converter);
-		dxil_spv_converter_set_srv_remapper(converter, RemapSrv, &translation);
-		dxil_spv_converter_set_uav_remapper(converter, RemapUav, &translation);
-		dxil_spv_converter_set_cbv_remapper(converter, RemapCbv, &translation);
-		dxil_spv_converter_set_sampler_remapper(converter, RemapSampler, &translation);
-		dxil_spv_converter_set_root_constant_word_count(converter, translation.rootSignature->rootWords);
+		// OptiScaler enables the Vulkan memory model without its device scope unless the game asked for it, and Device
+		// scope is then invalid. A shader using it is translated again to the memory model, which uses QueueFamily
+		// scope instead, valid either way. The others stay out of it, translated as before
+		bool ok = false;
+		for (bool memoryModel : { false, true })
+		{
+			if (memoryModel && !(ok && device->vulkanMemoryModel && UsesDeviceScope(spirv)))
+				break;
 
-		// Without it dot4add is emulated with plain integer math
-		dxil_spv_option_shader_i8_dot i8Dot{ { DXIL_SPV_OPTION_SHADER_I8_DOT }, device->integerDotProduct };
-		dxil_spv_converter_add_option(converter, &i8Dot.base);
+			translation.bindings.clear();
+			dxil_spv_converter converter = nullptr;
+			dxil_spv_create_converter(blob, &converter);
+			dxil_spv_converter_set_srv_remapper(converter, RemapSrv, &translation);
+			dxil_spv_converter_set_uav_remapper(converter, RemapUav, &translation);
+			dxil_spv_converter_set_cbv_remapper(converter, RemapCbv, &translation);
+			dxil_spv_converter_set_sampler_remapper(converter, RemapSampler, &translation);
+			dxil_spv_converter_set_root_constant_word_count(converter, translation.rootSignature->rootWords);
 
-		// Storage buffers bind at their first element, any multiple of 4 bytes
-		dxil_spv_option_ssbo_alignment ssboAlignment{ { DXIL_SPV_OPTION_SSBO_ALIGNMENT },
-			std::max<unsigned>((unsigned)device->properties.limits.minStorageBufferOffsetAlignment, 1) };
-		dxil_spv_converter_add_option(converter, &ssboAlignment.base);
+			// Without it dot4add is emulated with plain integer math
+			dxil_spv_option_shader_i8_dot i8Dot{ { DXIL_SPV_OPTION_SHADER_I8_DOT }, device->integerDotProduct };
+			dxil_spv_converter_add_option(converter, &i8Dot.base);
 
-		dxil_spv_option_vulkan_memory_model memoryModel{ { DXIL_SPV_OPTION_VULKAN_MEMORY_MODEL }, device->vulkanMemoryModel };
-		dxil_spv_converter_add_option(converter, &memoryModel.base);
+			// Storage buffers bind at their first element, any multiple of 4 bytes
+			dxil_spv_option_ssbo_alignment ssboAlignment{ { DXIL_SPV_OPTION_SSBO_ALIGNMENT },
+				std::max<unsigned>((unsigned)device->properties.limits.minStorageBufferOffsetAlignment, 1) };
+			dxil_spv_converter_add_option(converter, &ssboAlignment.base);
 
-		bool ok = dxil_spv_converter_run(converter) == DXIL_SPV_SUCCESS;
+			dxil_spv_option_vulkan_memory_model vulkanMemoryModel{ { DXIL_SPV_OPTION_VULKAN_MEMORY_MODEL }, memoryModel };
+			dxil_spv_converter_add_option(converter, &vulkanMemoryModel.base);
+
+			ok = dxil_spv_converter_run(converter) == DXIL_SPV_SUCCESS;
+			if (ok)
+			{
+				dxil_spv_compiled_spirv compiled{};
+				dxil_spv_converter_get_compiled_spirv(converter, &compiled);
+
+				spirv.assign(static_cast<const uint32_t*>(compiled.data),
+					static_cast<const uint32_t*>(compiled.data) + compiled.size / 4);
+			}
+			else
+			{
+				Log::Error("D3D12OnVk: dxil-spirv can't translate a {} byte shader", bytecode.BytecodeLength);
+			}
+
+			dxil_spv_converter_free(converter);
+		}
+
 		if (ok)
 		{
-			dxil_spv_compiled_spirv compiled{};
-			dxil_spv_converter_get_compiled_spirv(converter, &compiled);
-
-			spirv.assign(static_cast<const uint32_t*>(compiled.data),
-				static_cast<const uint32_t*>(compiled.data) + compiled.size / 4);
-			FuseDotAccumulate(spirv);
+			if (device->fuseDots)
+				FuseDotAccumulate(spirv);
 			FindSampledImageSigns(spirv, translation.bindings);
 		}
-		else
-		{
-			Log::Error("D3D12OnVk: dxil-spirv can't translate a {} byte shader", bytecode.BytecodeLength);
-		}
 
-		dxil_spv_converter_free(converter);
 		dxil_spv_parsed_blob_free(blob);
 		return ok;
 	}
@@ -2445,6 +2487,7 @@ ID3D12Device* D3D12OnVk::CreateDevice(const DeviceInfo& info)
 	vk.vkGetPhysicalDeviceProperties2(info.physicalDevice, &properties);
 	device->properties = properties.properties;
 	device->storageBuffers = device->properties.limits.minStorageBufferOffsetAlignment <= 4;
+	device->fuseDots = device->properties.vendorID == 0x1002;
 	if (id.deviceLUIDValid)
 		memcpy(&device->luid, id.deviceLUID, sizeof(LUID));
 
@@ -2457,8 +2500,7 @@ ID3D12Device* D3D12OnVk::CreateDevice(const DeviceInfo& info)
 	vk.vkGetPhysicalDeviceFeatures2(info.physicalDevice, &features);
 	device->integerDotProduct = features13.shaderIntegerDotProduct && vk.vkGetDeviceImageMemoryRequirements;
 
-	// OptiScaler enables the Vulkan memory model without its device scope unless the game asked for it, and Device
-	// scope is then invalid. DXIL translated to the memory model uses QueueFamily scope instead, valid either way
+	// For DXIL shaders using Device scope, see Translate
 	// ponytail: like integer dot products, assumes the device enabled the memory model when the GPU has it
 	device->vulkanMemoryModel = features12.vulkanMemoryModel;
 
