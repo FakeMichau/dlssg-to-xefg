@@ -318,6 +318,7 @@ namespace
 
 		// Raw and structured SRVs can be storage buffers when any 4-byte aligned range can be bound as one
 		bool storageBuffers = false;
+		bool vulkanMemoryModel = false; // assumed enabled, the DXIL shaders are translated to it
 
 		// The game's command buffer of the evaluation in progress. XeFG's own command lists record into it instead of
 		// being submitted, a game's queues are only safe to use from the game
@@ -973,6 +974,37 @@ namespace
 	}
 
 	// Pipelines
+	enum class IntegerSign : uint8_t
+	{
+		None,
+		Unsigned,
+		Signed,
+	};
+
+	// The integer format of the other signedness with the same components, else format itself
+	VkFormat WithSign(VkFormat format, IntegerSign sign)
+	{
+		constexpr std::pair<VkFormat, VkFormat> Pairs[] = {
+			{ VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT },
+			{ VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SINT },
+			{ VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SINT },
+			{ VK_FORMAT_R16_UINT, VK_FORMAT_R16_SINT },
+			{ VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SINT },
+			{ VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R16G16B16A16_SINT },
+			{ VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT },
+			{ VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_SINT },
+			{ VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT },
+		};
+
+		for (auto [u, s] : Pairs)
+		{
+			if (format == u || format == s)
+				return sign == IntegerSign::Unsigned ? u : sign == IntegerSign::Signed ? s : format;
+		}
+
+		return format;
+	}
+
 	struct Binding
 	{
 		uint32_t binding;
@@ -981,6 +1013,7 @@ namespace
 		uint32_t parameter, offset; // where in the root signature's tables the descriptors are
 		VkSampler sampler;          // static samplers
 		VkImageViewType viewType;   // what the shader declared, D3D12 lets a 2D view stand in for a 2D array
+		IntegerSign sign = IntegerSign::None; // of a sampled image's components, as the shader declared them
 	};
 
 	struct PipelineState : Object
@@ -1249,6 +1282,46 @@ namespace
 		spirv = std::move(out);
 	}
 
+	// The signedness the shader declared for each integer sampled image binding, from its OpTypeImage
+	void FindSampledImageSigns(std::span<const uint32_t> spirv, std::vector<Binding>& bindings)
+	{
+		constexpr uint32_t OpTypeInt = 21, OpTypeImage = 25, OpTypeArray = 28, OpTypeRuntimeArray = 29,
+			OpTypePointer = 32, OpVariable = 59, OpDecorate = 71, DecorationBinding = 33;
+
+		std::map<uint32_t, uint32_t> bindingOf, types; // variable to binding; pointer, array or image type to inner type
+		std::map<uint32_t, IntegerSign> ints;
+		std::vector<std::pair<uint32_t, uint32_t>> variables; // id, pointer type
+		for (size_t i = 5; i < spirv.size() && spirv[i] >> 16 && i + (spirv[i] >> 16) <= spirv.size(); i += spirv[i] >> 16)
+		{
+			const uint32_t op = spirv[i] & 0xFFFF, words = spirv[i] >> 16;
+			if (op == OpDecorate && words == 4 && spirv[i + 2] == DecorationBinding)
+				bindingOf[spirv[i + 1]] = spirv[i + 3];
+			else if (op == OpTypeInt && words == 4)
+				ints[spirv[i + 1]] = spirv[i + 3] ? IntegerSign::Signed : IntegerSign::Unsigned;
+			else if ((op == OpTypeImage || op == OpTypeArray || op == OpTypeRuntimeArray) && words >= 3)
+				types[spirv[i + 1]] = spirv[i + 2];
+			else if (op == OpTypePointer && words == 4)
+				types[spirv[i + 1]] = spirv[i + 3];
+			else if (op == OpVariable && words >= 4)
+				variables.push_back({ spirv[i + 2], spirv[i + 1] });
+		}
+
+		for (auto [variable, type] : variables)
+		{
+			auto binding = bindingOf.find(variable);
+			if (binding == bindingOf.end() || binding->second >= bindings.size() ||
+				bindings[binding->second].type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+				continue;
+
+			// Pointer, arrays, image, component type
+			for (int depth = 0; depth < 4 && !ints.contains(type) && types.contains(type); depth++)
+				type = types[type];
+
+			if (auto sign = ints.find(type); sign != ints.end())
+				bindings[binding->second].sign = sign->second;
+		}
+	}
+
 	bool Translate(Device* device, const D3D12_SHADER_BYTECODE& bytecode, Translation& translation,
 		std::vector<uint32_t>& spirv)
 	{
@@ -1278,6 +1351,9 @@ namespace
 			std::max<unsigned>((unsigned)device->properties.limits.minStorageBufferOffsetAlignment, 1) };
 		dxil_spv_converter_add_option(converter, &ssboAlignment.base);
 
+		dxil_spv_option_vulkan_memory_model memoryModel{ { DXIL_SPV_OPTION_VULKAN_MEMORY_MODEL }, device->vulkanMemoryModel };
+		dxil_spv_converter_add_option(converter, &memoryModel.base);
+
 		bool ok = dxil_spv_converter_run(converter) == DXIL_SPV_SUCCESS;
 		if (ok)
 		{
@@ -1287,6 +1363,7 @@ namespace
 			spirv.assign(static_cast<const uint32_t*>(compiled.data),
 				static_cast<const uint32_t*>(compiled.data) + compiled.size / 4);
 			FuseDotAccumulate(spirv);
+			FindSampledImageSigns(spirv, translation.bindings);
 		}
 		else
 		{
@@ -1621,11 +1698,18 @@ namespace
 					case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
 					case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
 					{
+						// The view's integer components must have the signedness the shader declared, where D3D12 reads
+						// them through the view's. The layer's own images are mutable, external ones keep their view.
+						// A signed view read as unsigned is sign-extended on D3D12, zero-extended here: XeFG's one such
+						// read masks the extended bits off
 						VkImageView view = d.imageView;
-						if (d.kind == Descriptor::Image && d.key.type != b.viewType)
+						const VkFormat format = d.kind == Descriptor::Image && !d.resource->external
+							? WithSign(d.key.format, b.sign) : d.key.format;
+						if (d.kind == Descriptor::Image && (d.key.type != b.viewType || format != d.key.format))
 						{
 							ViewKey key = d.key;
 							key.type = b.viewType;
+							key.format = format;
 							if (key.type == VK_IMAGE_VIEW_TYPE_2D)
 								key.layers = 1;
 
@@ -2367,10 +2451,16 @@ ID3D12Device* D3D12OnVk::CreateDevice(const DeviceInfo& info)
 	// vkGetDeviceProcAddr returns no 1.3 core functions for a device created below 1.3, which then can't use the
 	// feature unless it enabled VK_KHR_shader_integer_dot_product
 	// ponytail: assumes a 1.3 device enabled the feature when the GPU has it, and ignores the extension on older ones
-	VkPhysicalDeviceVulkan13Features features13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+	VkPhysicalDeviceVulkan12Features features12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+	VkPhysicalDeviceVulkan13Features features13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &features12 };
 	VkPhysicalDeviceFeatures2 features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features13 };
 	vk.vkGetPhysicalDeviceFeatures2(info.physicalDevice, &features);
 	device->integerDotProduct = features13.shaderIntegerDotProduct && vk.vkGetDeviceImageMemoryRequirements;
+
+	// OptiScaler enables the Vulkan memory model without its device scope unless the game asked for it, and Device
+	// scope is then invalid. DXIL translated to the memory model uses QueueFamily scope instead, valid either way
+	// ponytail: like integer dot products, assumes the device enabled the memory model when the GPU has it
+	device->vulkanMemoryModel = features12.vulkanMemoryModel;
 
 	VkPipelineCacheCreateInfo cacheInfo{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
 	vk.vkCreatePipelineCache(info.device, &cacheInfo, nullptr, &device->pipelineCache);
